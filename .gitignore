@@ -39,3 +39,6 @@
 
 # debug information files
 *.dwo
+
+# sFoundation code
+Linux_Software/
