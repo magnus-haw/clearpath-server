@@ -7,6 +7,8 @@
 #include <iomanip>
 #include <sstream>
 #include <ctime>
+#include <atomic>        
+#include <mutex>
 #include "pubSysCls.h"
 #include "json.hpp"
 #include "httplib.h"
@@ -18,6 +20,17 @@ using namespace std::chrono;
 #define TIME_TILL_TIMEOUT 10000
 static const char* TELEMETRY_DIR = "./";
 static const int SERVER_PORT = 8080;
+
+// ---------------------------------------------------------------------
+// Global system state
+// ---------------------------------------------------------------------
+struct SystemState {
+    std::atomic<std::string> status{"idle"};
+    std::atomic<bool> stop_requested{false};
+    std::mutex mtx;
+    json last_step;
+};
+static SystemState g_state;
 
 // ---------------------------------------------------------------------
 // Utility: current wall-clock string
@@ -63,7 +76,11 @@ void log_telemetry(std::ofstream &log, INode &node,
 // ---------------------------------------------------------------------
 int run_motion_sequence(const std::string &json_path) {
     try {
+        g_state.status = "initializing";
+        g_state.stop_requested = false;
+
         json sequence = load_motion_sequence(json_path);
+        g_state.status = "running";
         std::cout << "Loaded " << sequence.size() << " steps from JSON.\n";
 
         std::vector<std::string> ports;
@@ -117,7 +134,15 @@ int run_motion_sequence(const std::string &json_path) {
 
         // --- Execute sequence ---
         for (size_t i = 0; i < sequence.size(); ++i) {
+            if (g_state.stop_requested) {
+                std::cout << "Stop requested, aborting sequence.\n";
+                break;
+            }
             const auto &cmd = sequence[i];
+            {
+                std::lock_guard<std::mutex> lock(g_state.mtx);
+                g_state.last_step = cmd;
+            }
             int node_idx = cmd.value("node", 0);
             if (node_idx < 0 || node_idx >= (int)node_count) {
                 std::cerr << "Invalid node index at step " << i + 1 << "\n";
@@ -132,6 +157,7 @@ int run_motion_sequence(const std::string &json_path) {
                 if (node.Motion.Homing.HomingValid()) {
                     node.Motion.Homing.Initiate();
                     while (!node.Motion.Homing.WasHomed()) {
+                        if (g_state.stop_requested) break;
                         std::this_thread::sleep_for(std::chrono::milliseconds(50));
                         log_telemetry(log, node, t0);
                     }
@@ -146,6 +172,7 @@ int run_motion_sequence(const std::string &json_path) {
                           << ": dwell " << sec << " s\n";
                 auto start = steady_clock::now();
                 while (duration<double>(steady_clock::now() - start).count() < sec) {
+                    if (g_state.stop_requested) break;
                     log_telemetry(log, node, t0);
                     std::this_thread::sleep_for(std::chrono::milliseconds(50));
                 }
@@ -163,12 +190,17 @@ int run_motion_sequence(const std::string &json_path) {
                 node.Motion.VelLimit = vel;
                 node.Motion.MovePosnStart(pos);
                 while (!node.Motion.MoveIsDone()) {
+                    if (g_state.stop_requested) {
+                        node.Motion.NodeStop();
+                        break;
+                    }
                     log_telemetry(log, node, t0);
                     std::this_thread::sleep_for(std::chrono::milliseconds(5));
                 }
                 log_telemetry(log, node, t0);
             }
         }
+        g_state.status = g_state.stop_requested ? "stopped" : "complete";
 
         for (size_t i = 0; i < node_count; ++i) {
             port.Nodes(i).EnableReq(false);
@@ -225,9 +257,27 @@ void start_http_server() {
         res.set_content(buffer.str(), "text/csv");
     });
 
-    svr.Get("/status", [](const httplib::Request &, httplib::Response &res) {
-        res.set_content("{\"status\":\"ready\"}", "application/json");
+    svr.Post("/stop", [](const httplib::Request&, httplib::Response& res) {
+        if (g_state.status == "running") {
+            g_state.stop_requested = true;
+            g_state.status = "stopping";
+            res.set_content(R"({"status":"stopping"})", "application/json");
+        } else {
+            res.set_content(R"({"status":"not_running"})", "application/json");
+        }
     });
+
+    svr.Get("/status", [](const httplib::Request&, httplib::Response& res) {
+        json j;
+        j["status"] = g_state.status.load();
+        {
+            std::lock_guard<std::mutex> lock(g_state.mtx);
+            j["last_step"] = g_state.last_step;
+        }
+        j["stop_requested"] = g_state.stop_requested.load();
+        res.set_content(j.dump(), "application/json");
+    });
+
 
     std::cout << "HTTP server running on port " << SERVER_PORT << " …" << std::endl;
     svr.listen("0.0.0.0", SERVER_PORT);

@@ -1,1 +1,9 @@
-[  {"home": true, "node": 0},  {"home": true, "node": 1},  {"pos": 10000, "vel": 800, "accel": 1500, "node": 0},  {"dwell": 0.5, "node": 0},  {"pos": -5000, "vel": 700, "accel": 1200, "node": 0},  {"pos": -30000, "vel": 200, "accel": 10000, "node": 1},  {"dwell": 1.0, "node": 1},  {"pos": 10000, "vel": 200, "accel": 10000, "node": 1}]
+[  {"home": true, "node": 0},  
+   {"home": true, "node": 1},  
+   {"pos": 10000, "vel": 800, "accel": 1500, "node": 0},  
+   {"dwell": 5, "node": 0},  
+   {"pos": -5000, "vel": 700, "accel": 1200, "node": 0},  
+   {"pos": -30000, "vel": 200, "accel": 10000, "node": 1},  
+   {"dwell": 1.0, "node": 1},  
+   {"pos": 10000, "vel": 200, "accel": 10000, "node": 1}
+]
