@@ -1,0 +1,4 @@
+curl -X POST -H "Content-Type: application/json" -d '{}' http://192.168.0.243:8080/stop
+curl -X POST http://192.168.0.243:8080/run -H "Content-Type: application/json" -d @motion_sequence.json
+curl http://192.168.0.243:8080/status
+curl http://192.168.0.243:8080/node/0/status

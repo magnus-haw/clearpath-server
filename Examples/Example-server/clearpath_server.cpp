@@ -25,12 +25,67 @@ static const int SERVER_PORT = 8080;
 // Global system state
 // ---------------------------------------------------------------------
 struct SystemState {
-    std::atomic<std::string> status{"idle"};
-    std::atomic<bool> stop_requested{false};
+    std::string status = "idle";
+    bool stop_requested = false;
     std::mutex mtx;
     json last_step;
 };
 static SystemState g_state;
+
+// ---------------------------------------------------------------------
+// Persistent Motion Controller
+// ---------------------------------------------------------------------
+struct MotionController {
+    std::mutex mtx;
+    SysManager* mgr = nullptr;
+    IPort* port = nullptr;
+    bool connected = false;
+
+    bool connect() {
+        std::lock_guard<std::mutex> lock(mtx);
+        if (connected) return true;
+
+        std::vector<std::string> ports;
+        SysManager::FindComHubPorts(ports);
+        if (ports.empty()) {
+            std::cerr << "No SC hubs found\n";
+            return false;
+        }
+
+        mgr = SysManager::Instance();
+        mgr->ComHubPort(0, ports[0].c_str());
+        mgr->PortsOpen(1);
+        port = &mgr->Ports(0);
+        connected = true;
+        std::cout << "Connected to " << port->NodeCount() << " ClearPath node(s)\n";
+        return true;
+    }
+
+    void disconnect() {
+        std::lock_guard<std::mutex> lock(mtx);
+        if (!connected) return;
+        mgr->PortsClose();
+        mgr = nullptr;
+        port = nullptr;
+        connected = false;
+        std::cout << "Disconnected ClearPath ports\n";
+    }
+
+    bool ensure_connected() {
+        if (!connected) return connect();
+        try {
+            port->Nodes(0).Status.RT.Refresh();
+            return true;
+        } catch (...) {
+            connected = false;
+            return connect();
+        }
+    }
+};
+
+static MotionController g_motion;
+
+
 
 // ---------------------------------------------------------------------
 // Utility: current wall-clock string
@@ -76,25 +131,34 @@ void log_telemetry(std::ofstream &log, INode &node,
 // ---------------------------------------------------------------------
 int run_motion_sequence(const std::string &json_path) {
     try {
-        g_state.status.store("initializing");
-        g_state.stop_requested.store(false);
+        {
+            std::lock_guard<std::mutex> lock(g_state.mtx);
+            g_state.status = "loading sequence";
+            g_state.stop_requested = false;
+        }
 
         json sequence = load_motion_sequence(json_path);
-        g_state.status.store("running");
+        {
+            std::lock_guard<std::mutex> lock(g_state.mtx);
+            g_state.status = "enabling motors";
+        }
         std::cout << "Loaded " << sequence.size() << " steps from JSON.\n";
 
-        std::vector<std::string> ports;
-        SysManager::FindComHubPorts(ports);
-        if (ports.empty())
-            throw std::runtime_error("No SC hubs found");
+        if (!g_motion.ensure_connected())
+            throw std::runtime_error("Failed to connect to ClearPath");
 
-        SysManager *mgr = SysManager::Instance();
-        mgr->ComHubPort(0, ports[0].c_str());
-        mgr->PortsOpen(1);
-        IPort &port = mgr->Ports(0);
+        SysManager* mgr = g_motion.mgr;
+        IPort& port = *g_motion.port;
+
+
         size_t node_count = port.NodeCount();
-        if (node_count == 0)
+        if (node_count == 0) {
+            {
+                std::lock_guard<std::mutex> lock(g_state.mtx);
+                g_state.status = "No ClearPath nodes found";
+            }
             throw std::runtime_error("No ClearPath nodes found");
+        }
         std::cout << "Found " << node_count << " node(s).\n";
 
         // --- Enable all nodes ---
@@ -108,8 +172,9 @@ int run_motion_sequence(const std::string &json_path) {
 
             double timeout = mgr->TimeStampMsec() + TIME_TILL_TIMEOUT;
             while (!n.Motion.IsReady()) {
-                if (mgr->TimeStampMsec() > timeout)
+                if (mgr->TimeStampMsec() > timeout) {
                     throw std::runtime_error("Timeout enabling node " + std::to_string(i));
+                }
             }
             n.AccUnit(INode::RPM_PER_SEC);
             n.VelUnit(INode::RPM);
@@ -133,16 +198,25 @@ int run_motion_sequence(const std::string &json_path) {
         }
 
         // --- Execute sequence ---
+        {
+            std::lock_guard<std::mutex> lock(g_state.mtx);
+            g_state.status = "running";
+        }
+
         for (size_t i = 0; i < sequence.size(); ++i) {
-            if (g_state.stop_requested.load()) {
+            bool stop_req_copy = false;
+            stop_req_copy = g_state.stop_requested;
+            if (stop_req_copy) {
                 std::cout << "Stop requested, aborting sequence.\n";
                 break;
             }
+
             const auto &cmd = sequence[i];
             {
                 std::lock_guard<std::mutex> lock(g_state.mtx);
                 g_state.last_step = cmd;
             }
+
             int node_idx = cmd.value("node", 0);
             if (node_idx < 0 || node_idx >= (int)node_count) {
                 std::cerr << "Invalid node index at step " << i + 1 << "\n";
@@ -157,7 +231,7 @@ int run_motion_sequence(const std::string &json_path) {
                 if (node.Motion.Homing.HomingValid()) {
                     node.Motion.Homing.Initiate();
                     while (!node.Motion.Homing.WasHomed()) {
-                        if (g_state.stop_requested.load()) break;
+                        if (g_state.stop_requested) break;
                         std::this_thread::sleep_for(std::chrono::milliseconds(50));
                         log_telemetry(log, node, t0);
                     }
@@ -172,7 +246,7 @@ int run_motion_sequence(const std::string &json_path) {
                           << ": dwell " << sec << " s\n";
                 auto start = steady_clock::now();
                 while (duration<double>(steady_clock::now() - start).count() < sec) {
-                    if (g_state.stop_requested.load()) break;
+                    if (g_state.stop_requested) break;
                     log_telemetry(log, node, t0);
                     std::this_thread::sleep_for(std::chrono::milliseconds(50));
                 }
@@ -190,8 +264,8 @@ int run_motion_sequence(const std::string &json_path) {
                 node.Motion.VelLimit = vel;
                 node.Motion.MovePosnStart(pos);
                 while (!node.Motion.MoveIsDone()) {
-                    if (g_state.load()) {
-                        node.Motion.NodeStop();
+                    if (g_state.stop_requested) {
+                        node.Motion.NodeStop(STOP_TYPE_RAMP);
                         break;
                     }
                     log_telemetry(log, node, t0);
@@ -200,13 +274,17 @@ int run_motion_sequence(const std::string &json_path) {
                 log_telemetry(log, node, t0);
             }
         }
-        g_state.status.store(g_state.stop_requested.load() ? "stopped" : "complete");
+
+        {
+            std::lock_guard<std::mutex> lock(g_state.mtx);
+            g_state.status = g_state.stop_requested ? "stopped" : "complete";
+        }
 
         for (size_t i = 0; i < node_count; ++i) {
             port.Nodes(i).EnableReq(false);
             logs[i].close();
         }
-        mgr->PortsClose();
+        
         std::cout << "Sequence complete.\n";
     } catch (mnErr &e) {
         std::cerr << "Teknic error: " << e.ErrorMsg << "\n";
@@ -217,6 +295,7 @@ int run_motion_sequence(const std::string &json_path) {
     }
     return 0;
 }
+
 
 // ---------------------------------------------------------------------
 // Embedded HTTP server
@@ -257,36 +336,84 @@ void start_http_server() {
         res.set_content(buffer.str(), "text/csv");
     });
 
+    // ---------------------------------------------------------------------
+    // In /stop endpoint
+    // ---------------------------------------------------------------------
     svr.Post("/stop", [](const httplib::Request&, httplib::Response& res) {
-        if (g_state.status.load() == "running") {
-            g_state.stop_requested.store(true);
-            g_state.status.store("stopping");
+        std::lock_guard<std::mutex> lock(g_state.mtx);
+        if (g_state.status == "running") {
+            g_state.stop_requested = true;
+            g_state.status = "stopping";
             res.set_content(R"({"status":"stopping"})", "application/json");
         } else {
             res.set_content(R"({"status":"not_running"})", "application/json");
         }
     });
 
-
+    // ---------------------------------------------------------------------
+    // In /status endpoint
+    // ---------------------------------------------------------------------
     svr.Get("/status", [](const httplib::Request&, httplib::Response& res) {
         json j;
-        j["status"] = g_state.status.load();
         {
             std::lock_guard<std::mutex> lock(g_state.mtx);
+            j["status"] = g_state.status;
             j["last_step"] = g_state.last_step;
+            j["stop_requested"] = g_state.stop_requested;
         }
-        j["stop_requested"] = g_state.stop_requested.load();
         res.set_content(j.dump(), "application/json");
     });
 
+    // ---------------------------------------------------------------------
+    // /node/<id>/status endpoint
+    // ---------------------------------------------------------------------
+    svr.Get(R"(/node/(\d+)/status)", [](const httplib::Request &req, httplib::Response &res) {
+        // Make sure the connection exists or try to reconnect
+        if (!g_motion.ensure_connected() || !g_motion.port) {
+            res.status = 503;
+            res.set_content(R"({"error":"no active ClearPath connection"})", "application/json");
+            return;
+        }
+
+        int node_id = std::stoi(req.matches[1]);
+
+        // Lock the controller during hardware access
+        std::lock_guard<std::mutex> lock(g_motion.mtx);
+        size_t node_count = g_motion.port->NodeCount();
+
+        if (node_id < 0 || node_id >= static_cast<int>(node_count)) {
+            res.set_content(R"({"error":"invalid node index"})", "application/json");
+            res.status = 404;
+            return;
+        }
+
+        INode& node = g_motion.port->Nodes(node_id);
+
+        // Refresh status registers safely
+        node.Motion.PosnMeasured.Refresh();
+        node.Motion.VelMeasured.Refresh();
+        node.Status.RT.Refresh();
+
+        json j;
+        j["node"] = node_id;
+        j["pos"] = node.Motion.PosnMeasured.Value();
+        j["vel"] = node.Motion.VelMeasured.Value();
+        j["enabled"] = node.Status.RT.Value().cpm.Enabled;
+        j["ready"] = node.Motion.IsReady();
+
+        res.set_content(j.dump(), "application/json");
+    });
 
     std::cout << "HTTP server running on port " << SERVER_PORT << " …" << std::endl;
     svr.listen("0.0.0.0", SERVER_PORT);
+
+
 }
 
 // ---------------------------------------------------------------------
 int main() {
     try {
+        g_motion.connect();   // persistent initialization
         start_http_server();
     } catch (const std::exception &e) {
         std::cerr << "Fatal error: " << e.what() << std::endl;
