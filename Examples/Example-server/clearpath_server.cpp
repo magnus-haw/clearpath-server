@@ -76,11 +76,11 @@ void log_telemetry(std::ofstream &log, INode &node,
 // ---------------------------------------------------------------------
 int run_motion_sequence(const std::string &json_path) {
     try {
-        g_state.status = "initializing";
-        g_state.stop_requested = false;
+        g_state.status.store("initializing");
+        g_state.stop_requested.store(false);
 
         json sequence = load_motion_sequence(json_path);
-        g_state.status = "running";
+        g_state.status.store("running");
         std::cout << "Loaded " << sequence.size() << " steps from JSON.\n";
 
         std::vector<std::string> ports;
@@ -134,7 +134,7 @@ int run_motion_sequence(const std::string &json_path) {
 
         // --- Execute sequence ---
         for (size_t i = 0; i < sequence.size(); ++i) {
-            if (g_state.stop_requested) {
+            if (g_state.stop_requested.load()) {
                 std::cout << "Stop requested, aborting sequence.\n";
                 break;
             }
@@ -157,7 +157,7 @@ int run_motion_sequence(const std::string &json_path) {
                 if (node.Motion.Homing.HomingValid()) {
                     node.Motion.Homing.Initiate();
                     while (!node.Motion.Homing.WasHomed()) {
-                        if (g_state.stop_requested) break;
+                        if (g_state.stop_requested.load()) break;
                         std::this_thread::sleep_for(std::chrono::milliseconds(50));
                         log_telemetry(log, node, t0);
                     }
@@ -172,7 +172,7 @@ int run_motion_sequence(const std::string &json_path) {
                           << ": dwell " << sec << " s\n";
                 auto start = steady_clock::now();
                 while (duration<double>(steady_clock::now() - start).count() < sec) {
-                    if (g_state.stop_requested) break;
+                    if (g_state.stop_requested.load()) break;
                     log_telemetry(log, node, t0);
                     std::this_thread::sleep_for(std::chrono::milliseconds(50));
                 }
@@ -190,7 +190,7 @@ int run_motion_sequence(const std::string &json_path) {
                 node.Motion.VelLimit = vel;
                 node.Motion.MovePosnStart(pos);
                 while (!node.Motion.MoveIsDone()) {
-                    if (g_state.stop_requested) {
+                    if (g_state.load()) {
                         node.Motion.NodeStop();
                         break;
                     }
@@ -200,7 +200,7 @@ int run_motion_sequence(const std::string &json_path) {
                 log_telemetry(log, node, t0);
             }
         }
-        g_state.status = g_state.stop_requested ? "stopped" : "complete";
+        g_state.status.store(g_state.stop_requested.load() ? "stopped" : "complete");
 
         for (size_t i = 0; i < node_count; ++i) {
             port.Nodes(i).EnableReq(false);
@@ -235,7 +235,7 @@ void start_http_server() {
                 run_motion_sequence(seq_path);
             }).detach();
 
-            res.set_content(R"({"status":"started"})", "application/json");
+            res.set_content(R"({"status":"sequence received"})", "application/json");
         } catch (const std::exception &e) {
             res.status = 500;
             res.set_content(std::string("{\"error\":\"") + e.what() + "\"}",
@@ -258,14 +258,15 @@ void start_http_server() {
     });
 
     svr.Post("/stop", [](const httplib::Request&, httplib::Response& res) {
-        if (g_state.status == "running") {
-            g_state.stop_requested = true;
-            g_state.status = "stopping";
+        if (g_state.status.load() == "running") {
+            g_state.stop_requested.store(true);
+            g_state.status.store("stopping");
             res.set_content(R"({"status":"stopping"})", "application/json");
         } else {
             res.set_content(R"({"status":"not_running"})", "application/json");
         }
     });
+
 
     svr.Get("/status", [](const httplib::Request&, httplib::Response& res) {
         json j;
